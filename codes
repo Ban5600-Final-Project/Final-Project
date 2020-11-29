@@ -1,0 +1,589 @@
+pip install handyspark
+
+pip install imbalanced-learn
+
+from pyspark.sql import SQLContext
+from pyspark.sql import DataFrameNaFunctions
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import DecisionTreeClassifier
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.classification import LinearSVC
+from pyspark.ml.classification import NaiveBayes
+from pyspark.ml.feature import Binarizer
+from pyspark.ml.feature import OneHotEncoder, VectorAssembler, StringIndexer, VectorIndexer
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.sql.functions import avg
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+%matplotlib inline
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+from pyspark.mllib.evaluation import MulticlassMetrics
+from pyspark.mllib.evaluation import BinaryClassificationMetrics
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from imblearn.over_sampling import SMOTE
+from imblearn.combine import SMOTEENN
+from sklearn.model_selection import train_test_split
+from collections import Counter
+import pyspark.ml.feature as ft
+from handyspark import *
+import findspark
+
+
+#set up and import data
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName('myproj').getOrCreate()
+data = spark.read.csv('C:\Users\fuzel\Desktop\train.csv',inferSchema=True,header=True)
+
+#Data types
+data.printSchema()
+
+
+#Drop the varibles that have no meaning 
+df = data.select(['Gender',  'Age',  'Driving_license',  'Previously_Insured',  'Vehicle_Age',  'Vehicle_Damage',
+ 'Annual_Premium','Vintage','Response'])
+
+
+#Descriptive analysis 
+#for numerical variables
+df.select([ 'Age','Annual_Premium','Vintage']).describe().show()
+
+
+#Visualization for categorical variables
+# distribution of vehicle_age in database
+df.registerTempTable("data")
+display(sqlContext.sql("select * from data"))
+
+
+# distribution of Response in database
+display(sqlContext.sql("select * from data"))
+
+
+# distribution of Gender in database
+display(sqlContext.sql("select * from data"))
+
+# distribution of Driving_license in database
+display(sqlContext.sql("select * from data"))
+
+# distribution of Vehicle_Damage in database
+display(sqlContext.sql("select * from data"))
+
+
+# distribution of Previously_insured in database
+display(sqlContext.sql("select * from data"))
+
+
+#chech out missing values
+from pyspark.sql.functions import *
+from pyspark.sql.functions import when, count, col
+df.select([count(when(isnull(c), c)).alias(c) for c in df.columns]).show()
+
+
+#Detect outliers
+quantiles = {
+    c: dict(
+        zip(["q1", "q3"], df.approxQuantile(c, [0.25, 0.75], 0))
+    )
+    for c in ["Age", "Annual_Premium","Vintage"]
+}
+quantiles
+
+
+for i in quantiles:
+    iqr = quantiles[i]['q3'] - quantiles[i]['q1']
+    quantiles[i]['lower_bound'] = quantiles[i]['q1'] - (iqr * 1.5)
+    quantiles[i]['upper_bound'] = quantiles[i]['q3'] + (iqr * 1.5)
+print(quantiles)
+
+
+#create columns that contain outliers information of each column
+import pyspark.sql.functions as f
+df_clean=df.select(
+    "*",
+    *[
+        f.when(
+            f.col(c).between(quantiles[c]['lower_bound'], quantiles[c]['upper_bound']),
+            0
+        ).otherwise(1).alias(c+"_out") 
+        for c in ["Age", "Annual_Premium","Vintage"]
+    ]
+)
+df_clean.show(10)
+
+
+#create a column that tell the numbers of outliers of each row
+from pyspark.sql.functions import col
+df_clean=df_clean.withColumn("outliers", col("Age_out")+col("Annual_Premium_out")+col("Vintage_out"))
+df_clean.show()
+
+
+#number of rows of having outliers and normal data
+num_outliers = count((col("outliers") == 1)).alias("num_outliers")
+df_clean.groupBy("outliers").agg(num_outliers).show()
+
+
+#Dropping outliers
+df = df.withColumn(
+    "Annual_Premium",
+    when(
+        col("Annual_Premium").between(quantiles["Annual_Premium"]['lower_bound'], quantiles["Annual_Premium"]['upper_bound']),
+        col("Annual_Premium")
+    ).otherwise(None)
+)
+df.describe().show()
+
+
+#imputing na with mean
+df=df.na.fill(29264.6)
+df.select(['Annual_Premium']).describe().show()
+
+
+#Handling with categorical variables
+#Dropping extremely unbalance variables
+df = df.select(['Gender',  'Age', 'Previously_Insured',  'Vehicle_Age',  'Vehicle_Damage',
+ 'Annual_Premium','Vintage','Response'])
+
+
+#Regroup "Vehicle_Age" Variable
+df = df.replace("> 2 Years","> 1 Year")
+df = df.replace("1-2 Year","> 1 Year")
+df.registerTempTable("data")
+display(sqlContext.sql("select * from data"))
+
+
+#convert string to number
+gender_indexer = StringIndexer(inputCol='Gender',outputCol='GenderIndex')
+VehicleAge_indexer = StringIndexer(inputCol='Vehicle_Age',outputCol='VehicleAgeIndex')
+VehicleDamage_indexer = StringIndexer(inputCol='Vehicle_Damage',outputCol='VehicleDamageIndex')
+pipeline = Pipeline(stages=[gender_indexer,VehicleAge_indexer,
+                           VehicleDamage_indexer])
+fit_model = pipeline.fit(df)
+ImputeDF = fit_model.transform(df)
+ImputeDF = ImputeDF.select(['GenderIndex',  'Age', 'Previously_Insured',  'VehicleAgeIndex',  'VehicleDamageIndex',
+ 'Annual_Premium','Vintage','Response'])
+ImputeDF.select(['GenderIndex', 'VehicleAgeIndex',  'VehicleDamageIndex']).describe().show()
+
+#Deal with unbalanced data(resampling)
+#1.Down
+DF_minor=ImputeDF.filter((ImputeDF.Response == 1))
+DF_major=ImputeDF.filter((ImputeDF.Response == 0))
+ratio = int(DF_major.count()/DF_minor.count())
+sampled_majority_df = DF_major.sample(False,1/ratio)
+DF_resampled_down = sampled_majority_df.unionAll(DF_minor)
+DF_resampled_down.count()
+print('Rows of Data after undersampling:{}'.format(DF_resampled_down.count()))
+
+
+#check the result of Undersampling
+responses =DF_resampled_down.groupBy('Response').count().collect()
+categories = [i[0] for i in responses]
+counts = [i[1] for i in responses]
+ 
+ind = np.array(range(len(categories)))
+width = 0.35
+plt.bar(ind, counts, width=width, color='r')
+ 
+plt.ylabel('counts')
+plt.title('Response')
+plt.xticks(ind + width/2., categories)
+
+
+#2.Up
+a = range(ratio)
+# duplicate the minority rows
+oversampled_df = DF_minor.withColumn("dummy", explode(array([lit(x) for x in a]))).drop('dummy')
+# combine both oversampled minority rows and previous majority rows 
+DF_resampled_up = DF_major.unionAll(oversampled_df)
+print('Rows of Data after oversampling:{}'.format(DF_resampled_up.count()))
+
+
+#check the result of Oversampling
+responses = DF_resampled_up.groupBy('Response').count().collect()
+categories = [i[0] for i in responses]
+counts = [i[1] for i in responses]
+ 
+ind = np.array(range(len(categories)))
+width = 0.35
+plt.bar(ind, counts, width=width, color='r')
+ 
+plt.ylabel('counts')
+plt.title('Response')
+plt.xticks(ind + width/2., categories)
+
+#3.SMOTE
+X = ImputeDF.toPandas().filter(items=['Age', 'GenderIndex','Previously_Insured','VehicleAgeIndex','VehicleDamageIndex','Annual_Premium','Vintage'])
+Y = ImputeDF.toPandas().filter(items=['Response'])
+X.shape, Y.shape
+
+
+#Train test split data
+X_train, X_test, Y_train, Y_test = train_test_split(X, Y, test_size=0.2, random_state=0)
+
+#Imply SMOTE
+sm = SMOTE(random_state=12, sampling_strategy = 'auto')
+x_train_res, y_train_res = sm.fit_sample(X_train, Y_train)
+
+
+#combine them back
+dataframe_1 = pd.DataFrame(x_train_res,columns=['Age', 'GenderIndex','Previously_Insured','VehicleAgeIndex','VehicleDamageIndex','Annual_Premium','Vintage'])
+dataframe_2 = pd.DataFrame(y_train_res, columns = ['Response'])
+result = dataframe_1.combine_first(dataframe_2)
+DF_resampled_smo = spark.createDataFrame(result)
+print('Rows of Data after SMOTE:{}'.format(DF_resampled_smo.count()))
+
+
+#check the result of  SMOTE resampling
+responses = DF_resampled_smo.groupBy('Response').count().collect()
+categories = [i[0] for i in responses]
+counts = [i[1] for i in responses]
+ 
+ind = np.array(range(len(categories)))
+width = 0.35
+plt.bar(ind, counts, width=width, color='r')
+ 
+plt.ylabel('counts')
+plt.title('Response')
+plt.xticks(ind + width/2., categories)
+
+
+#4. No resampling
+DF_no_resample=ImputeDF
+
+
+#Reduce Dimension 1
+#Random Forest Importance
+def rf_feature_selection(data):
+    input_cols_Label= ['Age', 'GenderIndex','Previously_Insured','VehicleAgeIndex','VehicleDamageIndex','Annual_Premium','Vintage']
+    assembler_Label = VectorAssembler(inputCols=input_cols_Label,outputCol='features')
+    rf = RandomForestClassifier(featuresCol='features',labelCol='Response')
+    pipeline_rf_Label = Pipeline(stages=[assembler_Label,rf])
+    fit_rf_Label = pipeline_rf_Label.fit(data)
+    featureImp=fit_rf_Label.stages[-1].featureImportances
+    dataset=fit_rf_Label.transform(data)
+    list_extract = []
+    for i in dataset.schema["features"].metadata["ml_attr"]["attrs"]:
+        list_extract = list_extract + dataset.schema["features"].metadata["ml_attr"]["attrs"][i]
+    varlist = pd.DataFrame(list_extract)
+    varlist['score'] = varlist['idx'].apply(lambda x: featureImp[x])
+    features_imp=varlist.sort_values('score', ascending = False)
+    features=features_imp[features_imp.score>0.05].iloc[:,1].tolist()
+    return(features,features_imp)
+
+#results of rf feature selection of each resampled data
+vars_no_resample, feature_importance_noresample=rf_feature_selection(DF_no_resample)
+vars_resampled_down, feature_importance_downresample=rf_feature_selection(DF_resampled_down)
+vars_resampled_up,feature_importance_upresample=rf_feature_selection(DF_resampled_up)
+vars_resampled_smo, feature_importance_smoresample=rf_feature_selection(DF_resampled_smo)
+print(vars_no_resample)
+print(vars_resampled_down)
+print(vars_resampled_up)
+print(vars_resampled_smo)
+
+
+#feature importance
+feature_importance_noresample
+
+
+#Reduce Dimension 2
+#PCA
+pca = ft.PCA(k=2, inputCol="featuresforpca", outputCol="features")
+
+
+#standardize features
+standard = ft.StandardScaler(withMean=False, withStd=True, inputCol='featuresforstand', outputCol='features')
+standardforpca = ft.StandardScaler(withMean=False, withStd=True, inputCol='featuresforstand', outputCol='featuresforpca')
+
+#Train test split
+train_no_resample, test_no_resample = DF_no_resample.randomSplit([0.8,0.2],110)
+train_resampled_up, test_resampled_up = DF_resampled_up.randomSplit([0.8,0.2],110)
+train_resampled_down, test_resampled_down = DF_resampled_down.randomSplit([0.8,0.2],110)
+train_resampled_smo, test_resampled_smo = DF_resampled_smo.randomSplit([0.8,0.2],110)
+
+
+#models
+log_reg = LogisticRegression(featuresCol='features',labelCol='Response')
+rf = RandomForestClassifier(featuresCol='features',labelCol='Response')
+SVC = LinearSVC(featuresCol='features',labelCol='Response')
+DT = DecisionTreeClassifier(featuresCol='features',labelCol='Response')
+
+
+#create assemblers for pipelines below
+all_features=['GenderIndex',  'Age', 'Previously_Insured',  'VehicleAgeIndex',  'VehicleDamageIndex',
+ 'Annual_Premium','Vintage']
+assembler_noresample_rf = VectorAssembler(inputCols= vars_no_resample ,outputCol='featuresforstand')
+assembler_downresample_rf = VectorAssembler(inputCols= vars_resampled_down ,outputCol='featuresforstand')
+assembler_upresample_rf = VectorAssembler(inputCols= vars_resampled_up ,outputCol='featuresforstand')
+assembler_smoteresample_rf = VectorAssembler(inputCols= vars_resampled_smo ,outputCol='featuresforstand')
+assembler_pca= VectorAssembler(inputCols= all_features ,outputCol='featuresforstand')
+
+
+#pipelines: pipeline_'resamplemethods'_'reduce dimension methods'_'modelname'
+pipeline_no_rf_log = Pipeline(stages=[assembler_noresample_rf,standard,log_reg])
+pipeline_down_rf_log=Pipeline(stages=[assembler_downresample_rf,standard,log_reg])
+pipeline_up_rf_log=Pipeline(stages=[assembler_upresample_rf,standard,log_reg])
+pipeline_smo_rf_log=Pipeline(stages=[assembler_smoteresample_rf,standard,log_reg])
+pipeline_no_pca_log = Pipeline(stages=[assembler_pca,standardforpca,pca,log_reg])
+pipeline_down_pca_log = Pipeline(stages=[assembler_pca,standardforpca,pca,log_reg])
+pipeline_up_pca_log = Pipeline(stages=[assembler_pca,standardforpca,pca,log_reg])
+pipeline_smo_pca_log = Pipeline(stages=[assembler_pca,standardforpca,pca,log_reg])
+pipeline_no_rf_rf= Pipeline(stages=[assembler_noresample_rf,standard,rf])
+pipeline_down_rf_rf=Pipeline(stages=[assembler_downresample_rf,standard,rf])
+pipeline_up_rf_rf=Pipeline(stages=[assembler_upresample_rf,standard,rf])
+pipeline_smo_rf_rf=Pipeline(stages=[assembler_smoteresample_rf,standard,rf])
+pipeline_no_pca_rf = Pipeline(stages=[assembler_pca,standardforpca,pca,rf])
+pipeline_down_pca_rf = Pipeline(stages=[assembler_pca,standardforpca,pca,rf])
+pipeline_up_pca_rf = Pipeline(stages=[assembler_pca,standardforpca,pca,rf])
+pipeline_smo_pca_rf = Pipeline(stages=[assembler_pca,standardforpca,pca,rf])
+pipeline_no_rf_SVC = Pipeline(stages=[assembler_noresample_rf,standard,SVC])
+pipeline_down_rf_SVC=Pipeline(stages=[assembler_downresample_rf,standard,SVC])
+pipeline_up_rf_SVC=Pipeline(stages=[assembler_upresample_rf,standard,SVC])
+pipeline_smo_rf_SVC=Pipeline(stages=[assembler_smoteresample_rf,standard,SVC])
+pipeline_no_pca_SVC = Pipeline(stages=[assembler_pca,standardforpca,pca,SVC])
+pipeline_down_pca_SVC = Pipeline(stages=[assembler_pca,standardforpca,pca,SVC])
+pipeline_up_pca_SVC = Pipeline(stages=[assembler_pca,standardforpca,pca,SVC])
+pipeline_smo_pca_SVC = Pipeline(stages=[assembler_pca,standardforpca,pca,SVC])
+pipeline_no_rf_DT= Pipeline(stages=[assembler_noresample_rf,standard,DT])
+pipeline_down_rf_DT=Pipeline(stages=[assembler_downresample_rf,standard,DT])
+pipeline_up_rf_DT=Pipeline(stages=[assembler_upresample_rf,standard,DT])
+pipeline_smo_rf_DT=Pipeline(stages=[assembler_smoteresample_rf,standard,DT])
+pipeline_no_pca_DT = Pipeline(stages=[assembler_pca,standardforpca,pca,DT])
+pipeline_down_pca_DT = Pipeline(stages=[assembler_pca,standardforpca,pca,DT])
+pipeline_up_pca_DT = Pipeline(stages=[assembler_pca,standardforpca,pca,DT])
+pipeline_smo_pca_DT = Pipeline(stages=[assembler_pca,standardforpca,pca,DT])
+
+
+#fitmodels: fitmodel_'resample methods'_'reduce dimension methods'_'modelname'
+fitmodel_no_rf_log = pipeline_no_rf_log.fit(train_no_resample)
+fitmodel_down_rf_log = pipeline_down_rf_log.fit(train_resampled_down)
+fitmodel_up_rf_log = pipeline_down_rf_log.fit(train_resampled_up)
+fitmodel_smo_rf_log = pipeline_down_rf_log.fit(train_resampled_smo)
+fitmodel_no_pca_log = pipeline_no_pca_log.fit(train_no_resample)
+fitmodel_down_pca_log = pipeline_down_pca_log.fit(train_resampled_down)
+fitmodel_up_pca_log = pipeline_up_pca_log.fit(train_resampled_up)
+fitmodel_smo_pca_log = pipeline_smo_pca_log.fit(train_resampled_smo)
+fitmodel_no_rf_rf = pipeline_no_rf_rf.fit(train_no_resample)
+fitmodel_down_rf_rf = pipeline_down_rf_rf.fit(train_resampled_down)
+fitmodel_up_rf_rf = pipeline_down_rf_rf.fit(train_resampled_up)
+fitmodel_smo_rf_rf = pipeline_down_rf_rf.fit(train_resampled_smo)
+fitmodel_no_pca_rf = pipeline_no_pca_rf.fit(train_no_resample)
+fitmodel_down_pca_rf = pipeline_down_pca_rf.fit(train_resampled_down)
+fitmodel_up_pca_rf = pipeline_up_pca_rf.fit(train_resampled_up)
+fitmodel_smo_pca_rf= pipeline_smo_pca_rf.fit(train_resampled_smo)
+fitmodel_no_rf_SVC = pipeline_no_rf_SVC.fit(train_no_resample)
+fitmodel_down_rf_SVC = pipeline_down_rf_SVC.fit(train_resampled_down)
+fitmodel_up_rf_SVC = pipeline_down_rf_SVC.fit(train_resampled_up)
+fitmodel_smo_rf_SVC = pipeline_down_rf_SVC.fit(train_resampled_smo)
+fitmodel_no_pca_SVC = pipeline_no_pca_SVC.fit(train_no_resample)
+fitmodel_down_pca_SVC = pipeline_down_pca_SVC.fit(train_resampled_down)
+fitmodel_up_pca_SVC = pipeline_up_pca_SVC.fit(train_resampled_up)
+fitmodel_smo_pca_SVC = pipeline_smo_pca_SVC.fit(train_resampled_smo)
+fitmodel_no_rf_DT = pipeline_no_rf_DT.fit(train_no_resample)
+fitmodel_down_rf_DT = pipeline_down_rf_DT.fit(train_resampled_down)
+fitmodel_up_rf_DT = pipeline_down_rf_DT.fit(train_resampled_up)
+fitmodel_smo_rf_DT = pipeline_down_rf_DT.fit(train_resampled_smo)
+fitmodel_no_pca_DT = pipeline_no_pca_DT.fit(train_no_resample)
+fitmodel_down_pca_DT = pipeline_down_pca_DT.fit(train_resampled_down)
+fitmodel_up_pca_DT = pipeline_up_pca_DT.fit(train_resampled_up)
+fitmodel_smo_pca_DT= pipeline_smo_pca_DT.fit(train_resampled_smo)
+
+#prediction results: result_"resmaple method"_"reduce dimension method"_"modelname"
+result_no_rf_log=fitmodel_no_rf_log.transform(test_no_resample)
+result_down_rf_log=fitmodel_down_rf_log.transform(test_resampled_down)
+result_up_rf_log=fitmodel_up_rf_log.transform(test_resampled_up)
+result_smo_rf_log=fitmodel_smo_rf_log.transform(test_resampled_smo)
+result_no_pca_log=fitmodel_no_pca_log.transform(test_no_resample)
+result_down_pca_log=fitmodel_down_pca_log.transform(test_resampled_down)
+result_up_pca_log=fitmodel_up_pca_log.transform(test_resampled_up)
+result_smo_pca_log=fitmodel_smo_pca_log.transform(test_resampled_smo)
+result_no_rf_rf=fitmodel_no_rf_rf.transform(test_no_resample)
+result_down_rf_rf=fitmodel_down_rf_rf.transform(test_resampled_down)
+result_up_rf_rf=fitmodel_up_rf_rf.transform(test_resampled_up)
+result_smo_rf_rf=fitmodel_smo_rf_rf.transform(test_resampled_smo)
+result_no_pca_rf=fitmodel_no_pca_rf.transform(test_no_resample)
+result_down_pca_rf=fitmodel_down_pca_rf.transform(test_resampled_down)
+result_up_pca_rf=fitmodel_up_pca_rf.transform(test_resampled_up)
+result_smo_pca_rf=fitmodel_smo_pca_rf.transform(test_resampled_smo)
+result_no_rf_SVC=fitmodel_no_rf_SVC.transform(test_no_resample)
+result_down_rf_SVC=fitmodel_down_rf_SVC.transform(test_resampled_down)
+result_up_rf_SVC=fitmodel_up_rf_SVC.transform(test_resampled_up)
+result_smo_rf_SVC=fitmodel_smo_rf_SVC.transform(test_resampled_smo)
+result_no_pca_SVC=fitmodel_no_pca_SVC.transform(test_no_resample)
+result_down_pca_SVC=fitmodel_down_pca_SVC.transform(test_resampled_down)
+result_up_pca_SVC=fitmodel_up_pca_SVC.transform(test_resampled_up)
+result_smo_pca_SVC=fitmodel_smo_pca_SVC.transform(test_resampled_smo)
+result_no_rf_DT=fitmodel_no_rf_DT.transform(test_no_resample)
+result_down_rf_DT=fitmodel_down_rf_DT.transform(test_resampled_down)
+result_up_rf_DT=fitmodel_up_rf_DT.transform(test_resampled_up)
+result_smo_rf_DT=fitmodel_smo_rf_DT.transform(test_resampled_smo)
+result_no_pca_DT=fitmodel_no_pca_DT.transform(test_no_resample)
+result_down_pca_DT=fitmodel_down_pca_DT.transform(test_resampled_down)
+result_up_pca_DT=fitmodel_up_pca_DT.transform(test_resampled_up)
+result_smo_pca_DT=fitmodel_smo_pca_DT.transform(test_resampled_smo)
+
+
+AUC_eval = BinaryClassificationEvaluator(rawPredictionCol='rawPrediction', labelCol='Response')
+Accu_evaluator = MulticlassClassificationEvaluator()
+Accu_evaluator.setPredictionCol('prediction')
+Accu_evaluator.setLabelCol('Response')
+
+
+
+#AUC and accurancy of each result
+#AUCs: AUC_"resmaple method"_"reduce dimension method"_"modelname"
+#Accurancys: Accu_"resmaple method"_"reduce dimension method"_"modelname"
+AUC_no_rf_log = AUC_eval.evaluate(result_no_rf_log)
+Accu_no_rf_log = Accu_evaluator.evaluate(result_no_rf_log, {Accu_evaluator.metricName: "accuracy"})
+AUC_down_rf_log = AUC_eval.evaluate(result_down_rf_log)
+Accu_down_rf_log = Accu_evaluator.evaluate(result_down_rf_log, {Accu_evaluator.metricName: "accuracy"})
+AUC_up_rf_log = AUC_eval.evaluate(result_up_rf_log)
+Accu_up_rf_log = Accu_evaluator.evaluate(result_up_rf_log, {Accu_evaluator.metricName: "accuracy"})
+AUC_smo_rf_log = AUC_eval.evaluate(result_smo_rf_log)
+Accu_smo_rf_log = Accu_evaluator.evaluate(result_smo_rf_log, {Accu_evaluator.metricName: "accuracy"})
+AUC_no_pca_log = AUC_eval.evaluate(result_no_pca_log)
+Accu_no_pca_log = Accu_evaluator.evaluate(result_no_pca_log, {Accu_evaluator.metricName: "accuracy"})
+AUC_down_pca_log = AUC_eval.evaluate(result_down_pca_log)
+Accu_down_pca_log = Accu_evaluator.evaluate(result_down_pca_log, {Accu_evaluator.metricName: "accuracy"})
+AUC_up_pca_log = AUC_eval.evaluate(result_up_pca_log)
+Accu_up_pca_log = Accu_evaluator.evaluate(result_up_pca_log, {Accu_evaluator.metricName: "accuracy"})
+AUC_smo_pca_log = AUC_eval.evaluate(result_smo_pca_log)
+Accu_smo_pca_log = Accu_evaluator.evaluate(result_smo_pca_log, {Accu_evaluator.metricName: "accuracy"})
+AUC_no_rf_rf = AUC_eval.evaluate(result_no_rf_rf)
+Accu_no_rf_rf = Accu_evaluator.evaluate(result_no_rf_rf, {Accu_evaluator.metricName: "accuracy"})
+AUC_down_rf_rf = AUC_eval.evaluate(result_down_rf_rf)
+Accu_down_rf_rf = Accu_evaluator.evaluate(result_down_rf_rf, {Accu_evaluator.metricName: "accuracy"})
+AUC_up_rf_rf = AUC_eval.evaluate(result_up_rf_rf)
+Accu_up_rf_rf = Accu_evaluator.evaluate(result_up_rf_rf, {Accu_evaluator.metricName: "accuracy"})
+AUC_smo_rf_rf = AUC_eval.evaluate(result_smo_rf_rf)
+Accu_smo_rf_rf= Accu_evaluator.evaluate(result_smo_rf_rf, {Accu_evaluator.metricName: "accuracy"})
+AUC_no_pca_rf = AUC_eval.evaluate(result_no_pca_rf)
+Accu_no_pca_rf = Accu_evaluator.evaluate(result_no_pca_rf, {Accu_evaluator.metricName: "accuracy"})
+AUC_down_pca_rf = AUC_eval.evaluate(result_down_pca_rf)
+Accu_down_pca_rf = Accu_evaluator.evaluate(result_down_pca_rf, {Accu_evaluator.metricName: "accuracy"})
+AUC_up_pca_rf = AUC_eval.evaluate(result_up_pca_rf)
+Accu_up_pca_rf = Accu_evaluator.evaluate(result_up_pca_rf, {Accu_evaluator.metricName: "accuracy"})
+AUC_smo_pca_rf = AUC_eval.evaluate(result_smo_pca_rf)
+Accu_smo_pca_rf = Accu_evaluator.evaluate(result_smo_pca_rf, {Accu_evaluator.metricName: "accuracy"})
+AUC_no_rf_SVC = AUC_eval.evaluate(result_no_rf_SVC)
+Accu_no_rf_SVC = Accu_evaluator.evaluate(result_no_rf_SVC, {Accu_evaluator.metricName: "accuracy"})
+AUC_down_rf_SVC = AUC_eval.evaluate(result_down_rf_SVC)
+Accu_down_rf_SVC = Accu_evaluator.evaluate(result_down_rf_SVC, {Accu_evaluator.metricName: "accuracy"})
+AUC_up_rf_SVC = AUC_eval.evaluate(result_up_rf_SVC)
+Accu_up_rf_SVC = Accu_evaluator.evaluate(result_up_rf_SVC, {Accu_evaluator.metricName: "accuracy"})
+AUC_smo_rf_SVC = AUC_eval.evaluate(result_smo_rf_SVC)
+Accu_smo_rf_SVC = Accu_evaluator.evaluate(result_smo_rf_SVC, {Accu_evaluator.metricName: "accuracy"})
+AUC_no_pca_SVC = AUC_eval.evaluate(result_no_pca_SVC)
+Accu_no_pca_SVC = Accu_evaluator.evaluate(result_no_pca_SVC, {Accu_evaluator.metricName: "accuracy"})
+AUC_down_pca_SVC = AUC_eval.evaluate(result_down_pca_SVC)
+Accu_down_pca_SVC = Accu_evaluator.evaluate(result_down_pca_SVC, {Accu_evaluator.metricName: "accuracy"})
+AUC_up_pca_SVC = AUC_eval.evaluate(result_up_pca_SVC)
+Accu_up_pca_SVC = Accu_evaluator.evaluate(result_up_pca_SVC, {Accu_evaluator.metricName: "accuracy"})
+AUC_smo_pca_SVC = AUC_eval.evaluate(result_smo_pca_SVC)
+Accu_smo_pca_SVC = Accu_evaluator.evaluate(result_smo_pca_SVC, {Accu_evaluator.metricName: "accuracy"})
+AUC_no_rf_DT = AUC_eval.evaluate(result_no_rf_DT)
+Accu_no_rf_DT = Accu_evaluator.evaluate(result_no_rf_DT, {Accu_evaluator.metricName: "accuracy"})
+AUC_down_rf_DT = AUC_eval.evaluate(result_down_rf_DT)
+Accu_down_rf_DT = Accu_evaluator.evaluate(result_down_rf_DT, {Accu_evaluator.metricName: "accuracy"})
+AUC_up_rf_DT = AUC_eval.evaluate(result_up_rf_DT)
+Accu_up_rf_DT = Accu_evaluator.evaluate(result_up_rf_DT, {Accu_evaluator.metricName: "accuracy"})
+AUC_smo_rf_DT = AUC_eval.evaluate(result_smo_rf_DT)
+Accu_smo_rf_DT = Accu_evaluator.evaluate(result_smo_rf_DT, {Accu_evaluator.metricName: "accuracy"})
+AUC_no_pca_DT = AUC_eval.evaluate(result_no_pca_DT)
+Accu_no_pca_DT = Accu_evaluator.evaluate(result_no_pca_DT, {Accu_evaluator.metricName: "accuracy"})
+AUC_down_pca_DT = AUC_eval.evaluate(result_down_pca_DT)
+Accu_down_pca_DT = Accu_evaluator.evaluate(result_down_pca_DT, {Accu_evaluator.metricName: "accuracy"})
+AUC_up_pca_DT = AUC_eval.evaluate(result_up_pca_DT)
+Accu_up_pca_DT = Accu_evaluator.evaluate(result_up_pca_DT, {Accu_evaluator.metricName: "accuracy"})
+AUC_smo_pca_DT = AUC_eval.evaluate(result_smo_pca_DT)
+Accu_smo_pca_DT = Accu_evaluator.evaluate(result_smo_pca_DT, {Accu_evaluator.metricName: "accuracy"})
+
+
+#combine the AUCs and accurancys to one table
+Results = spark.createDataFrame([
+    ("Logreg", 'no', "RandomForest",AUC_no_rf_log,Accu_no_rf_log),
+  ("Logreg", 'up', "RandomForest",AUC_up_rf_log,Accu_up_rf_log),
+  ("Logreg", 'down', "RandomForest",AUC_down_rf_log,Accu_down_rf_log),
+  ("Logreg", 'smo', "RandomForest",AUC_smo_rf_log,Accu_smo_rf_log),
+  ("Logreg", 'no', "PCA",AUC_no_pca_log,Accu_no_pca_log),
+  ("Logreg", 'up', "PCA",AUC_up_pca_log,Accu_up_pca_log),
+  ("Logreg", 'down', "PCA",AUC_down_pca_log,Accu_down_pca_log),
+  ("Logreg", 'smo', "PCA",AUC_smo_pca_log,Accu_smo_pca_log),
+  ("RandomForest", 'no', "RandomForest",AUC_no_pca_rf,Accu_no_rf_rf),
+  ("RandomForest", 'up', "RandomForest",AUC_up_rf_rf,Accu_up_rf_rf),
+  ("RandomForest", 'down', "RandomForest",AUC_down_rf_rf,Accu_down_rf_rf),
+  ("RandomForest", 'smo', "RandomForest",AUC_smo_rf_rf,Accu_smo_rf_rf),
+  ("RandomForest", 'no', "PCA",AUC_no_pca_rf,Accu_no_pca_rf),
+  ("RandomForest", 'up', "PCA",AUC_up_pca_rf,Accu_up_pca_rf),
+  ("RandomForest", 'down', "PCA",AUC_down_pca_rf,Accu_down_pca_rf),
+  ("RandomForest", 'smo', "PCA",AUC_smo_pca_rf,Accu_smo_pca_rf),
+  ("SVC", 'no', "RandomForest",AUC_no_rf_SVC,Accu_no_rf_SVC),
+  ("SVC", 'up', "RandomForest",AUC_up_rf_SVC,Accu_up_rf_SVC),
+  ("SVC", 'down', "RandomForest",AUC_down_rf_SVC,Accu_down_rf_SVC),
+  ("SVC", 'smo', "RandomForest",AUC_smo_rf_SVC,Accu_smo_rf_SVC),
+  ("SVC", 'no', "PCA",AUC_no_pca_SVC,Accu_no_pca_SVC),
+  ("SVC", 'up', "PCA",AUC_up_pca_SVC,Accu_up_pca_SVC),
+  ("SVC", 'down', "PCA",AUC_down_pca_SVC,Accu_down_pca_SVC),
+  ("SVC", 'smo', "PCA",AUC_smo_pca_SVC,Accu_smo_pca_SVC),
+  ("DecisionTree", 'no', "RandomForest",AUC_up_rf_DT,Accu_no_rf_DT),
+  ("DecisionTree", 'up', "RandomForest",AUC_up_rf_DT,Accu_up_rf_DT),
+  ("DecisionTree", 'down', "RandomForest",AUC_down_rf_DT,Accu_down_rf_DT),
+  ("DecisionTree", 'smo', "RandomForest",AUC_smo_rf_DT,Accu_smo_rf_DT),
+  ("DecisionTree", 'no', "PCA",AUC_no_pca_DT,Accu_no_pca_DT),
+  ("DecisionTree", 'up', "PCA",AUC_up_pca_DT,Accu_up_pca_DT),
+  ("DecisionTree", 'down', "PCA",AUC_down_pca_DT,Accu_down_pca_DT),
+  ("DecisionTree", 'smo', "PCA",AUC_smo_pca_DT,Accu_smo_pca_DT)  
+], ["ModelName", "ResampleMethod", "ReduceDimensionMethod",'AUC','Accuracy'])
+
+
+Results.show(32)
+
+
+df1 = Results.groupBy("ModelName").agg({"AUC": "avg","Accuracy":"avg"}).withColumnRenamed("avg(AUC)", "avg_AUC").withColumnRenamed("avg(Accuracy)","avg_Accu")
+df1 = df1.select("ModelName","avg_AUC","avg_Accu").show()
+
+
+df2 = Results.groupBy("ResampleMethod").agg({"AUC": "avg","Accuracy":"avg"}).withColumnRenamed("avg(AUC)", "avg_AUC").withColumnRenamed("avg(Accuracy)","avg_Accu")
+df2 = df2.select("ResampleMethod","avg_AUC","avg_Accu").show()
+
+
+df3 = Results.groupBy("ReduceDimensionMethod").agg({"AUC": "avg","Accuracy":"avg"}).withColumnRenamed("avg(AUC)", "avg_AUC").withColumnRenamed("avg(Accuracy)","avg_Accu")
+df3 = df3.select("ReduceDimensionMethod","avg_AUC","avg_Accu").show()
+
+
+
+#Make parameter tuning for selected model
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
+paramGrid = ParamGridBuilder() \
+    .addGrid(rf.numTrees, [int(x) for x in np.linspace(start = 3, stop = 9, num = 4)]) \
+    .addGrid(rf.maxDepth, [int(x) for x in np.linspace(start = 3, stop = 7, num = 3)]) \
+    .build()
+
+RF = TrainValidationSplit(estimator=pipeline_smo_pca_rf, evaluator=Accu_evaluator, estimatorParamMaps=paramGrid, trainRatio=0.7)
+Model = RF.fit(train_resampled_smo)
+
+#Parameters
+list(zip(Model.validationMetrics, Model.getEstimatorParamMaps()))
+
+#AUC, AUPR, Accuracy
+predictions = Model.transform(test_resampled_smo)
+evaluator = BinaryClassificationEvaluator(labelCol='Response')
+
+# We have only two choices: area under ROC and PR curves :-(
+auroc = evaluator.evaluate(predictions, {evaluator.metricName: "areaUnderROC"})
+auprc = evaluator.evaluate(predictions, {evaluator.metricName: "areaUnderPR"})
+Accu = Accu_evaluator.evaluate(predictions, {evaluator.metricName: "accuracy"})
+print("Area under ROC Curve: {:.4f}".format(auroc))
+print("Area under PR Curve: {:.4f}".format(auprc))
+print("Accuracy: {:.4f}".format(Accu))
+
+#ROC and PR Curve
+bcm = BinaryClassificationMetrics(predictions, scoreCol='probability', labelCol='Response')
+
+# We still can get the same metrics as the evaluator...
+print("Area under ROC Curve: {:.4f}".format(bcm.areaUnderROC))
+print("Area under PR Curve: {:.4f}".format(bcm.areaUnderPR))
+
+# But now we can PLOT both ROC and PR curves!
+fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+bcm.plot_roc_curve(ax=axs[0])
+bcm.plot_pr_curve(ax=axs[1])
