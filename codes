@@ -73,6 +73,7 @@ display(sqlContext.sql("select * from data"))
 display(sqlContext.sql("select * from data"))
 
 
+
 #chech out missing values
 from pyspark.sql.functions import *
 from pyspark.sql.functions import when, count, col
